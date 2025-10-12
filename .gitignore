@@ -1,9 +1,17 @@
-__pycache__/
-*.pyc
+.venv/
+venv/
+
+# dataset e pesi
+data/
+datasets/
+checkpoints/
 *.pth
 *.pt
-*.log
-.vscode/
-data/
-experiments/
-notebooks/
+*.ckpt
+*.bin
+*.tar
+*.zip
+
+# cache python
+__pycache__/
+*.pyc
