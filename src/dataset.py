@@ -267,8 +267,7 @@ class CrowdDataset(Dataset):
             "label_path": npy_path,
         }
         return sample
-
-# ============ API comoda per avere le transforms dall'esterno ============
+        
 def get_transforms(split: str = "train"):
     """Ritorna la pipeline di trasformazioni (lazy)."""
     return lazy_get_transforms(split)
