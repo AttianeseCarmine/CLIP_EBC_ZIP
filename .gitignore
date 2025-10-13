@@ -1,10 +1,16 @@
+# venv locali
 .venv/
 venv/
 
-# dataset e pesi
-data/
-datasets/
-checkpoints/
+# dataset e pesi: ignora tutto tranne il .gitkeep
+data/*
+!data/.gitkeep
+datasets/*
+!datasets/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+
+# pesi/archivi ovunque
 *.pth
 *.pt
 *.ckpt
