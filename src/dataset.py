@@ -88,8 +88,8 @@ def lazy_get_transforms(split: str):
 
         if split == "train":
             tfm = A.Compose([
-                A.LongestMaxSize(max_size=1024, interpolation=cv2.INTER_AREA),
-                A.RandomCrop(height=512, width=512, always_apply=True),
+                A.SmallestMaxSize(max_size=512, interpolation=cv2.INTER_AREA), 
+                A.RandomCrop(height=512, width=512, always_apply=True), 
                 A.HorizontalFlip(p=0.5),
                 A.Normalize(mean=(0.485, 0.456, 0.406),
                             std=(0.229, 0.224, 0.225)),
