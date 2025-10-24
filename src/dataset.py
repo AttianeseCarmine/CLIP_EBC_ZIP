@@ -1,8 +1,8 @@
-
 import os
 import glob
 import math
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
+import warnings
 
 import numpy as np
 import torch
@@ -16,6 +16,14 @@ def resize_density_map_keep_count(d: np.ndarray, out_h: int, out_w: int) -> np.n
     """
     Ridimensiona una density map preservando il conteggio totale (integrale).
     Usa INTER_NEAREST per mantenere la sparsità (zero rimane zero).
+    
+    Args:
+        d: Density map 2D
+        out_h: Altezza output
+        out_w: Larghezza output
+    
+    Returns:
+        Density map ridimensionata con conteggio preservato
     """
     assert d.ndim == 2, "density map deve essere 2D"
     h0, w0 = d.shape
@@ -23,42 +31,30 @@ def resize_density_map_keep_count(d: np.ndarray, out_h: int, out_w: int) -> np.n
         return d.astype(np.float32)
 
     d = d.astype(np.float32)
-    # nearest per non “spalmare” la massa sui vicini (sparsità)
     d_res = cv2.resize(d, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
 
-    # correzione di scala per conservare l'integrale
+    # Correzione di scala per conservare l'integrale
     scale = (h0 / out_h) * (w0 / out_w)
     d_res *= scale
 
-    # pulizia numerica minima: azzera veri zeri “quasi-zeri” con eps di macchina
-    # (non è una costante scelta a mano; dipende solo dal dtype)
+    # Pulizia numerica: azzera quasi-zeri
     eps = np.finfo(np.float32).eps
     d_res[abs(d_res) < eps] = 0.0
     return d_res
 
-def otsu_threshold(x: np.ndarray) -> float:
-    """
-    Soglia di Otsu su array 1D non-negativo.
-    Restituisce 0 se la varianza totale è nulla (caso degenerato).
-    """
-    x = x.astype(np.float32).ravel()
-    x = x[x >= 0]
-    if x.size == 0:
-        return 0.0
-    # istogramma automatico (256 bin su range dei dati)
-    hist, bin_edges = np.histogram(x, bins=256, range=(x.min(), x.max() if x.max()>x.min() else x.min()+1.0))
-    p = hist.astype(np.float64)
-    p /= p.sum() if p.sum() > 0 else 1.0
-    omega = np.cumsum(p)
-    mu = np.cumsum(p * (bin_edges[:-1] + bin_edges[1:]) * 0.5)
-    mu_t = mu[-1] if omega[-1] > 0 else 0.0
-    sigma_b2 = (mu_t * omega - mu)**2 / (omega * (1.0 - omega) + 1e-12)
-    k = int(np.nanargmax(sigma_b2))
-    thr = 0.5 * (bin_edges[k] + bin_edges[k+1])
-    return float(thr)
 
 def block_sum(arr: np.ndarray, bh: int, bw: int) -> np.ndarray:
-    """Somma per blocchi bh×bw (padding a destra/basso se non divisibile)."""
+    """
+    Somma per blocchi bh×bw (padding a destra/basso se non divisibile).
+    
+    Args:
+        arr: Array 2D
+        bh: Altezza blocco
+        bw: Larghezza blocco
+    
+    Returns:
+        Array con somme per blocco [n_blocks_h, n_blocks_w]
+    """
     assert arr.ndim == 2
     H, W = arr.shape
     Hp = math.ceil(H / bh) * bh
@@ -76,11 +72,25 @@ def safe_load_image(path: str) -> np.ndarray:
         return np.array(im.convert("RGB"))
 
 
-def lazy_get_transforms(split: str):
+def get_transforms(
+    split: str = "train",
+    img_size: int = 512,
+    val_size: int = 1024,
+    mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+    std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
+):
     """
-    Ritorna una funzione trasformazione compatibile con Albumentations
-    (dict con keys 'image' e 'mask'). Se Albumentations non è installato,
-    restituisce una trasformazione identità minimale.
+    Ritorna una funzione trasformazione compatibile con Albumentations.
+    
+    Args:
+        split: 'train', 'val', o 'test'
+        img_size: Dimensione crop per training
+        val_size: Dimensione massima per validation
+        mean: Media per normalizzazione
+        std: Deviazione standard per normalizzazione
+    
+    Returns:
+        Trasformazione Albumentations o fallback
     """
     try:
         import albumentations as A
@@ -88,45 +98,59 @@ def lazy_get_transforms(split: str):
 
         if split == "train":
             tfm = A.Compose([
-                A.SmallestMaxSize(max_size=512, interpolation=cv2.INTER_AREA), 
-                A.RandomCrop(height=512, width=512, always_apply=True), 
+                A.SmallestMaxSize(max_size=img_size, interpolation=cv2.INTER_AREA), 
+                A.RandomCrop(height=img_size, width=img_size, always_apply=True), 
                 A.HorizontalFlip(p=0.5),
-                A.Normalize(mean=(0.485, 0.456, 0.406),
-                            std=(0.229, 0.224, 0.225)),
+                A.Normalize(mean=mean, std=std),
                 ToTensorV2(),
             ])
         else:  # val/test
             tfm = A.Compose([
-                A.LongestMaxSize(max_size=1024, interpolation=cv2.INTER_AREA),
-                A.CenterCrop(height=512, width=512, always_apply=True),
-                A.Normalize(mean=(0.485, 0.456, 0.406),
-                            std=(0.229, 0.224, 0.225)),
+                A.LongestMaxSize(max_size=val_size, interpolation=cv2.INTER_AREA),
+                A.CenterCrop(height=img_size, width=img_size, always_apply=True),
+                A.Normalize(mean=mean, std=std),
                 ToTensorV2(),
             ])
         return tfm
 
-    except Exception:
-        # Fallback: identità (senza normalizzazione), ritorna tensori torch
-        def _fallback_transform(image, mask=None):
-            img = image.astype(np.float32) / 255.0
-            img_t = torch.from_numpy(img).permute(2, 0, 1)  # [3,H,W]
-            out = {"image": img_t}
-            if mask is not None:
-                out["mask"] = torch.from_numpy(mask.astype(np.float32))
-            return out
-
-        class _Wrapper:
+    except ImportError:
+        warnings.warn("Albumentations non disponibile. Uso trasformazione minimale.")
+        # Fallback: identità (senza normalizzazione)
+        class _FallbackTransform:
+            def __init__(self, img_size, mean, std):
+                self.img_size = img_size
+                self.mean = np.array(mean).reshape(3, 1, 1)
+                self.std = np.array(std).reshape(3, 1, 1)
+            
             def __call__(self, *, image, mask=None):
-                return _fallback_transform(image, mask)
-
-        return _Wrapper()
+                # Center crop
+                h, w = image.shape[:2]
+                if h > self.img_size or w > self.img_size:
+                    start_h = max(0, (h - self.img_size) // 2)
+                    start_w = max(0, (w - self.img_size) // 2)
+                    image = image[start_h:start_h+self.img_size, start_w:start_w+self.img_size]
+                    if mask is not None:
+                        mask = mask[start_h:start_h+self.img_size, start_w:start_w+self.img_size]
+                
+                # Normalizza
+                img = image.astype(np.float32) / 255.0
+                img = (img - self.mean.reshape(1, 1, 3)) / self.std.reshape(1, 1, 3)
+                img_t = torch.from_numpy(img).permute(2, 0, 1)  # [3,H,W]
+                
+                out = {"image": img_t}
+                if mask is not None:
+                    out["mask"] = torch.from_numpy(mask.astype(np.float32))
+                return out
+        
+        return _FallbackTransform(img_size, mean, std)
 
 
 # ============ Dataset ============
 
 class CrowdDataset(Dataset):
     """
-    Loader per crowd counting (stile ZIP / CLIP-EBC) con label .npy (density map).
+    Loader per crowd counting con label .npy (density map).
+    
     Struttura attesa:
         root/
           train/
@@ -135,6 +159,17 @@ class CrowdDataset(Dataset):
           val/
             images/*.jpg|png
             labels/*.npy
+    
+    Args:
+        root: Percorso root del dataset
+        dataset_name: Nome dataset (es. 'shanghaitech_a')
+        split: 'train', 'val', o 'test'
+        block_size: Dimensione blocco in pixel per block_counts
+        img_size: Dimensione crop training
+        val_size: Dimensione massima validation
+        pi_threshold: Soglia conteggio/pixel per classificare blocco come vuoto
+        transform: Trasformazione custom (se None usa default)
+        validate_pairs: Se True, valida che ogni immagine abbia il suo .npy
     """
     def __init__(
         self,
@@ -142,28 +177,33 @@ class CrowdDataset(Dataset):
         dataset_name: str,
         split: str = "train",
         block_size: int = 8,
+        img_size: int = 512,
+        val_size: int = 1024,
+        pi_threshold: Optional[float] = None,
         transform: Optional[Any] = None,
+        validate_pairs: bool = True,
     ):
         super().__init__()
         self.root = root
         self.dataset_name = dataset_name.lower()
         self.split = split
         self.block_size = int(block_size)
-        self.transform = transform or lazy_get_transforms(split)
-
+        self.pi_threshold = pi_threshold  # None = usa 0 esatto
+        
+        # Setup directories
         if "shanghai" in self.dataset_name:
-            # <root>/<split>/images, <root>/<split>/labels
             self.img_dir = os.path.join(root, split, "images")
             self.ann_dir = os.path.join(root, split, "labels")
         else:
-            # puoi estendere qui per UCF-QNRF / NWPU
-            raise ValueError(f"Dataset '{dataset_name}' non ancora supportato in questo loader.")
+            raise ValueError(f"Dataset '{dataset_name}' non supportato. "
+                           "Estendi il codice per UCF-QNRF/NWPU.")
 
         if not os.path.exists(self.img_dir):
             raise FileNotFoundError(f"Cartella immagini non trovata: {self.img_dir}")
         if not os.path.exists(self.ann_dir):
             raise FileNotFoundError(f"Cartella labels non trovata: {self.ann_dir}")
 
+        # Trova immagini
         self.img_paths = sorted(
             glob.glob(os.path.join(self.img_dir, "*.jpg")) +
             glob.glob(os.path.join(self.img_dir, "*.jpeg")) +
@@ -172,102 +212,201 @@ class CrowdDataset(Dataset):
         if len(self.img_paths) == 0:
             raise RuntimeError(f"Nessuna immagine trovata in {self.img_dir}")
 
-    def __len__(self) -> int:
-        return len(self.img_paths)
+        # Valida coppie immagine-label
+        if validate_pairs:
+            self._validate_pairs()
 
-    # ---- helpers ----
+        # Setup transforms
+        self.transform = transform or get_transforms(
+            split=split, 
+            img_size=img_size, 
+            val_size=val_size
+        )
+
+    def _validate_pairs(self):
+        """Valida che ogni immagine abbia il suo .npy corrispondente."""
+        missing = []
+        for img_path in self.img_paths:
+            try:
+                self._match_npy_for_image(img_path)
+            except FileNotFoundError:
+                missing.append(os.path.basename(img_path))
+        
+        if missing:
+            warnings.warn(
+                f"Trovate {len(missing)} immagini senza .npy corrispondente: "
+                f"{missing[:5]}{'...' if len(missing) > 5 else ''}"
+            )
+
     def _match_npy_for_image(self, img_path: str) -> str:
         """
         Trova il .npy corrispondente all'immagine.
-        Prova: <base>.npy, rimuove 'IMG_', prova zfill 3/4... e cerca per glob.
+        Prova: <base>.npy, rimuove 'IMG_', prova zfill 3/4/5, glob.
+        
+        Args:
+            img_path: Percorso immagine
+        
+        Returns:
+            Percorso file .npy
+        
+        Raises:
+            FileNotFoundError: Se .npy non trovato
         """
-        base = os.path.splitext(os.path.basename(img_path))[0]  # e.g., IMG_002 o 002
-        # 1) match diretto
+        base = os.path.splitext(os.path.basename(img_path))[0]
+        
+        # 1) Match diretto
         p = os.path.join(self.ann_dir, f"{base}.npy")
         if os.path.exists(p):
             return p
-        # 2) senza prefisso
+        
+        # 2) Senza prefisso IMG_
         alt = base.replace("IMG_", "")
         for cand in (alt, alt.zfill(3), alt.zfill(4), alt.zfill(5)):
             p = os.path.join(self.ann_dir, f"{cand}.npy")
             if os.path.exists(p):
                 return p
-        # 3) glob rilassato
+        
+        # 3) Glob rilassato
         matches = sorted(glob.glob(os.path.join(self.ann_dir, f"*{alt}*.npy")))
         if matches:
             return matches[0]
-        raise FileNotFoundError(f".npy per {base} non trovato in {self.ann_dir}")
+        
+        raise FileNotFoundError(
+            f".npy per '{base}' non trovato in {self.ann_dir}"
+        )
 
-    # ---- main ----
+    def __len__(self) -> int:
+        return len(self.img_paths)
+
+    def _compute_pi_target(self, block_counts: np.ndarray) -> np.ndarray:
+        """
+        Computa il target π (probabilità di essere vuoto) per ogni blocco.
+        
+        Strategia:
+        1. Se pi_threshold è None: usa 0 esatto (blocco vuoto se count == 0)
+        2. Se pi_threshold è fornito: usa soglia su conteggio/pixel
+        
+        Args:
+            block_counts: Conteggi per blocco [Hb, Wb]
+        
+        Returns:
+            π target [Hb, Wb]: 1.0 = vuoto, 0.0 = occupato
+        """
+        bs = self.block_size
+        
+        if self.pi_threshold is None:
+            # Criterio rigoroso: vuoto solo se esattamente 0
+            pi_gt = (block_counts == 0.0).astype(np.float32)
+        else:
+            # Criterio con soglia: normalizza per pixel
+            per_pix = block_counts / float(bs * bs)
+            pi_gt = (per_pix <= self.pi_threshold).astype(np.float32)
+        
+        return pi_gt
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         img_path = self.img_paths[idx]
         base_name = os.path.splitext(os.path.basename(img_path))[0]
 
-        # 1) immagine
+        # 1) Carica immagine
         img = safe_load_image(img_path)  # [H,W,3] uint8
 
-        # 2) density map (Shanghai .npy)
+        # 2) Carica density map
         npy_path = self._match_npy_for_image(img_path)
         density = np.load(npy_path)
         if density.ndim == 3:
             density = density[..., 0]
         density = density.astype(np.float32)
 
-        # -> allinea subito density a img (richiesto da Albumentations)
+        # 3) Allinea density a img (richiesto da Albumentations)
         if density.shape != img.shape[:2]:
-           density = resize_density_map_keep_count(density, img.shape[0], img.shape[1])
-           
-        # 3) transforms (stesse geo-trasformazioni su immagine e mask)
+            density = resize_density_map_keep_count(
+                density, img.shape[0], img.shape[1]
+            )
+        
+        # 4) Applica transforms (stesse geo-trasformazioni)
         if self.transform is not None:
-            try:
-                augmented = self.transform(image=img, mask=density)
-                img_t = augmented["image"]
-                density_t = augmented["mask"]
-                # Se ToTensorV2 è stato usato, density_t è torch.Tensor; altrimenti numpy
-                if isinstance(density_t, torch.Tensor):
-                    density_np = density_t.cpu().numpy().astype(np.float32)
-                else:
-                    density_np = density_t.astype(np.float32)
-            except TypeError:
-                # nel fallback custom
-                augmented = self.transform(image=img, mask=density)
-                img_t = augmented["image"]
-                density_np = augmented["mask"].numpy().astype(np.float32)
+            augmented = self.transform(image=img, mask=density)
+            img_t = augmented["image"]
+            density_t = augmented["mask"]
+            
+            # Converti a numpy se necessario
+            if isinstance(density_t, torch.Tensor):
+                density_np = density_t.cpu().numpy().astype(np.float32)
+            else:
+                density_np = density_t.astype(np.float32)
         else:
-            # fallback manuale
-            img_t = torch.from_numpy((img.astype(np.float32) / 255.0)).permute(2, 0, 1)
+            # Fallback manuale
+            img_t = torch.from_numpy(
+                (img.astype(np.float32) / 255.0)
+            ).permute(2, 0, 1)
             density_np = density
 
-        # 4) riallinea density a H,W esatti (safety) preservando il conteggio
+        # 5) Safety: riallinea density a dimensioni esatte
         H, W = img_t.shape[-2], img_t.shape[-1]
         if density_np.shape != (H, W):
             density_np = resize_density_map_keep_count(density_np, H, W)
 
-        # 5) target blockwise + π-head (senza costanti arbitrarie)
-        bs = self.block_size  # es. 8 pixel
-        block_counts = block_sum(density_np, bs, bs).astype(np.float32)  # [Hb,Wb]
-
-        # Primo criterio (rigoroso): blocco vuoto se conteggio esattamente 0
-        pi_gt = (block_counts == 0.0).astype(np.float32)
-
-        # Fallback adattivo se non esistono blocchi a zero (capita con alcune pre-elab)
-        if pi_gt.sum() == 0:
-            # normalizza per pixel e stima soglia con Otsu (data-driven)
-            per_pix = block_counts / float(bs * bs)
-            thr = otsu_threshold(per_pix)
-            pi_gt = (per_pix <= thr).astype(np.float32)
+        # 6) Computa target blockwise
+        bs = self.block_size
+        block_counts = block_sum(density_np, bs, bs).astype(np.float32)
+        pi_gt = self._compute_pi_target(block_counts)
 
         sample = {
             "image": img_t,
             "gt_density": torch.from_numpy(density_np),
             "gt_block_counts": torch.from_numpy(block_counts),
             "gt_pi": torch.from_numpy(pi_gt),
+            "count": float(density_np.sum()),  # Conteggio totale
             "base_name": base_name,
             "image_path": img_path,
             "label_path": npy_path,
         }
         return sample
+
+
+# ============ Utility per analisi dataset ============
+
+def analyze_dataset_statistics(dataset: CrowdDataset, num_samples: int = 100):
+    """
+    Analizza statistiche del dataset per calibrare iperparametri.
+    
+    Args:
+        dataset: Dataset da analizzare
+        num_samples: Numero di campioni da analizzare
+    
+    Returns:
+        Dict con statistiche
+    """
+    empty_ratios = []
+    counts = []
+    block_densities = []
+    
+    for i in range(min(num_samples, len(dataset))):
+        sample = dataset[i]
+        block_counts = sample["gt_block_counts"].numpy()
+        pi = sample["gt_pi"].numpy()
         
-def get_transforms(split: str = "train"):
-    """Ritorna la pipeline di trasformazioni (lazy)."""
-    return lazy_get_transforms(split)
+        empty_ratios.append(pi.mean())
+        counts.append(sample["count"])
+        block_densities.extend(block_counts.flatten())
+    
+    stats = {
+        "mean_empty_ratio": np.mean(empty_ratios),
+        "std_empty_ratio": np.std(empty_ratios),
+        "mean_count": np.mean(counts),
+        "median_count": np.median(counts),
+        "block_density_percentiles": {
+            "p25": np.percentile(block_densities, 25),
+            "p50": np.percentile(block_densities, 50),
+            "p75": np.percentile(block_densities, 75),
+            "p90": np.percentile(block_densities, 90),
+        }
+    }
+    
+    print("=== Dataset Statistics ===")
+    print(f"Empty ratio: {stats['mean_empty_ratio']:.3f} ± {stats['std_empty_ratio']:.3f}")
+    print(f"Avg count: {stats['mean_count']:.1f} (median: {stats['median_count']:.1f})")
+    print(f"Block density percentiles: {stats['block_density_percentiles']}")
+    
+    return stats
